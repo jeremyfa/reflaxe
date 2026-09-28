@@ -279,7 +279,21 @@ class EverythingIsExprSanitizer {
 					case _: false;
 				}
 
-				if(!isNonAssignable && !isBlocklikeExpr(old)) {
+				// An assignment used as the value (`tmp = (a = 1)`) is kept as a
+				// statement, then its target is assigned: `a = 1; tmp = a;`
+				final assignedTarget = switch(old.expr) {
+					case TBinop(OpAssign | OpAssignOp(_), target, _): target;
+					case _: null;
+				}
+
+				if(assignedTarget != null) {
+					topScopeArray.insert(index + 1, {
+						expr: TBinop(OpAssign, assigneeExpr, assignedTarget),
+						pos: assigneeExpr.pos,
+						t: assigneeExpr.t
+					});
+					index++;
+				} else if(!isNonAssignable && !isBlocklikeExpr(old)) {
 					topScopeArray[index] = {
 						expr: TBinop(OpAssign, assigneeExpr, old),
 						pos: assigneeExpr.pos,
@@ -485,14 +499,18 @@ class EverythingIsExprSanitizer {
 		to tranverse it and handle its sub-expressions.
 	**/
 	function handleNonValueBlock(e: TypedExpr): TypedExpr {
+		final childAssignee = isLastExpression() ? assigneeExpr : null;
+
 		if(options.convertIncrementAndDecrementOperators && isUnopExpr(e)) {
-			final newExpr = standardizeUnopValue(e, false);
+			// When this expression is the value of an assigned block (for example a
+			// branch of `tmp = c ? a++ : b++`), the increment must keep its value.
+			final newExpr = standardizeUnopValue(e, childAssignee != null);
 			if(newExpr != null) {
 				e = newExpr;
 			}
 		}
 
-		final eiec = new EverythingIsExprSanitizer(e, options, this, isLastExpression() ? assigneeExpr : null, nameGenerator);
+		final eiec = new EverythingIsExprSanitizer(e, options, this, childAssignee, nameGenerator);
 		return eiec.convertedExpr();
 	}
 
@@ -821,6 +839,13 @@ class EverythingIsExprSanitizer {
 		}
 	}
 
+	static function isIntType(t: Type): Bool {
+		return switch(haxe.macro.TypeTools.follow(t)) {
+			case TAbstract(_.get() => { pack: [], name: "Int" }, []): true;
+			case _: false;
+		}
+	}
+
 	function standardizeUnopValue(e: TypedExpr, expectValue: Bool): Null<TypedExpr> {
 		final opInfo = switch(e.expr) {
 			case TUnop(op, postfix, internalExpr): { op: op, postfix: postfix, e: internalExpr };
@@ -839,13 +864,28 @@ class EverythingIsExprSanitizer {
 		final opExpr = { expr: TBinop(OpAssignOp(getAddSubOp(isInc)), opInfo.e, oneExpr), pos: pos, t: t };
 
 		return if(expectValue) {
-			final secondExpr = if(opInfo.postfix) {
-				{ expr: TBinop(getAddSubOp(!isInc), opInfo.e, oneExpr), pos: pos, t: t };
+			if(opInfo.postfix && !isIntType(opInfo.e.t)) {
+				// Postfix on a non-integer: `x - 1` after `x += 1` is not exact for
+				// fractional values, so keep the old value in a temporary.
+				final tvar = genTVar(nameGenerator.generateName(opInfo.e.t, "old"), opInfo.e.t);
+				{
+					expr: TBlock([
+						{ expr: TVar(tvar, opInfo.e), pos: pos, t: t },
+						opExpr,
+						{ expr: TLocal(tvar), pos: pos, t: t }
+					]),
+					pos: pos,
+					t: t
+				};
 			} else {
-				opInfo.e;
-			}
+				final secondExpr = if(opInfo.postfix) {
+					{ expr: TBinop(getAddSubOp(!isInc), opInfo.e, oneExpr), pos: pos, t: t };
+				} else {
+					opInfo.e;
+				}
 
-			{ expr: TBlock([opExpr, secondExpr]), pos: pos, t: t };
+				{ expr: TBlock([opExpr, secondExpr]), pos: pos, t: t };
+			}
 		} else {
 			opExpr;
 		}
